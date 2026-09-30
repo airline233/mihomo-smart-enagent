@@ -21,13 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/airline233/mihomo-smart-enagent/cas"
 	"github.com/airline233/mihomo-smart-enagent/passkey"
 	"github.com/airline233/mihomo-smart-enagent/session"
 	"github.com/airline233/mihomo-smart-enagent/spa"
@@ -70,10 +68,14 @@ type EnAgentOption struct {
 	// 开启校验。
 	SkipCertVerify bool `proxy:"skip-cert-verify,omitempty"`
 	// StateDir 可选：会话 Cookie 缓存目录，用于跨重启复用会话、避免每次重启都跑
-	// CAS 登录。留空则只在内存里维持会话。
+	// CAS 登录。留空使用系统缓存目录；缓存按控制器和账号隔离。
 	StateDir string `proxy:"state-dir,omitempty"`
 	// UDP 是否支持 UDP。IPv6/UDP 数据面尚未在真机上证伪，默认关闭。
 	UDP bool `proxy:"udp,omitempty"`
+	// RenewInterval 为会话维护间隔（秒），0 使用默认 60，-1 禁用。
+	RenewInterval int `proxy:"renew-interval,omitempty"`
+	// HeartbeatTimeout 为等待入站帧的超时（秒），默认 30。
+	HeartbeatTimeout int `proxy:"heartbeat-timeout,omitempty"`
 }
 
 // EnAgent 是 outbound 实现。
@@ -82,14 +84,10 @@ type EnAgentOption struct {
 // 这一点很重要：内联在配置里的 passkey 私钥**绝不能**经外部控制器 API 泄露出去。
 type EnAgent struct {
 	*Base
-	option EnAgentOption
-
-	baseDialer C.Dialer
-
-	mu      sync.Mutex
-	manager *cas.Manager
-	stack   *stack.Stack
-	session *session.Session
+	option    EnAgentOption
+	shared    *enAgentState
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
@@ -112,6 +110,22 @@ func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
 		}
 	}
 
+	expected, err := bundle.Username()
+	if err != nil || username != expected {
+		return nil, errors.New("enagent: username 与 Passkey 账号不一致")
+	}
+	option.Username = username
+	option.Server = strings.ToLower(strings.TrimSuffix(option.Server, "."))
+	maxSeconds := int64((1<<63 - 1) / int64(time.Second))
+	if option.RenewInterval < -1 || option.HeartbeatTimeout < 0 || int64(option.RenewInterval) > maxSeconds || int64(option.HeartbeatTimeout) > maxSeconds {
+		return nil, errors.New("enagent: 会话维护或心跳超时配置非法")
+	}
+	if option.RenewInterval == 0 {
+		option.RenewInterval = 60
+	}
+	if option.HeartbeatTimeout == 0 {
+		option.HeartbeatTimeout = 30
+	}
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	outbound := &EnAgent{
 		Base: NewBase(BaseOption{
@@ -125,37 +139,13 @@ func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
 			Prefer:       option.IPVersion,
 		}),
 		option: option,
+		closed: make(chan struct{}),
 	}
-	outbound.baseDialer = option.NewDialer(outbound.DialOptions())
-
-	managerOpts := cas.ManagerOptions{
-		Config: cas.Config{
-			Bundle:               bundle,
-			Controller:           "https://" + addr,
-			Timeout:              defaultEnAgentTimeout,
-			ControllerSkipVerify: option.SkipCertVerify,
-			// 控制面流量走 mihomo 的 dialer，才能吃到 interface-name /
-			// routing-mark，也避免在 TUN auto-route 场景下绕回自己的隧道。
-			DialContext: outbound.baseDialer.DialContext,
-			Logf: func(format string, args ...any) {
-				log.Debugln("enagent[%s] "+format, append([]any{option.Name}, args...)...)
-			},
-		},
-	}
-	if option.StateDir != "" {
-		managerOpts.Cache = cas.FileCookieCache{
-			Path: filepath.Join(option.StateDir, enAgentSessionCacheFileName, enAgentCookieCacheFile),
-		}
-	} else if cacheDir, cacheErr := os.UserCacheDir(); cacheErr == nil {
-		managerOpts.Cache = cas.FileCookieCache{
-			Path: filepath.Join(cacheDir, "mihomo-enagent", enAgentCookieCacheFile),
-		}
-	}
-	manager, err := cas.NewManager(managerOpts)
+	shared, err := acquireEnAgentState(option, bundle, option.NewDialer(outbound.DialOptions()))
 	if err != nil {
-		return nil, fmt.Errorf("enagent[%s]: %w", option.Name, err)
+		return nil, err
 	}
-	outbound.manager = manager
+	outbound.shared = shared
 	return outbound, nil
 }
 
@@ -176,7 +166,7 @@ func (e *EnAgent) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn
 	conn, err := st.DialContext(ctx, "tcp", address)
 	if err != nil {
 		// 隧道可能已经不可用：丢掉栈，下一次拨号会重建整条链路。
-		e.invalidate(err)
+		e.shared.invalidate(err)
 		return nil, err
 	}
 	return NewConn(conn, e), nil
@@ -198,7 +188,7 @@ func (e *EnAgent) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	// 绑定本机虚拟地址上的随机端口；目的地由 WriteTo 决定。
 	pc, err := st.ListenPacket(ctx, network, net.JoinHostPort("0.0.0.0", "0"))
 	if err != nil {
-		e.invalidate(err)
+		e.shared.invalidate(err)
 		return nil, err
 	}
 	return NewPacketConn(pc, e), nil
@@ -240,74 +230,16 @@ func (h *enAgentPacketHandler) Inject(packet []byte) error {
 	return st.InjectIP(packet)
 }
 
-// ensureStack 保证"CAS 会话 + 隧道 + 用户态协议栈"这条链路可用。
-//
-// 整条链路必须单飞：同一账号同时只允许一条会话，并发建立会互相踢掉。
 func (e *EnAgent) ensureStack(ctx context.Context) (*stack.Stack, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.shared.ensureStack(ctx, e.closed)
+}
 
-	if e.stack != nil && e.session != nil && e.session.IsAlive() {
-		return e.stack, nil
-	}
-	if e.stack != nil {
-		_ = e.stack.Close()
-		e.stack = nil
-	}
-	if e.session != nil {
-		_ = e.session.Close()
-		e.session = nil
-	}
-
-	rules, err := e.manager.EnsureRules(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	endpoint, err := rules.FirstEndpoint()
-	if err != nil {
-		return nil, err
-	}
-
-	if e.option.SPA {
-		spaPort := rules.SPAPort
-		if spaPort <= 0 {
-			spaPort = spa.DefaultPort
-		}
-		if spaHost := rules.SPAHost(); spaHost != "" {
-			knockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := spa.Knock(knockCtx, spaHost, spaPort, spa.Options{User: e.username()})
-			cancel()
-			if err != nil {
-				// SPA 不是必需步骤，失败不阻断。
-				log.Warnln("enagent[%s]: SPA 敲门失败（忽略）: %v", e.option.Name, err)
-			} else {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(enAgentSPAKnockDelay):
-				}
-			}
-		}
-	}
-
+// buildStack 仅在共享建连任务中运行，不持有状态锁。
+func (e *enAgentState) buildStack(ctx context.Context) (*stack.Stack, *session.Session, error) {
 	handler := &enAgentPacketHandler{}
-	sess, err := session.Connect(ctx, session.Config{
-		Host:              endpoint.Host,
-		Port:              endpoint.Port,
-		User:              e.username(),
-		Token:             rules.Token,
-		SkipCertVerify:    e.option.SkipCertVerify,
-		OnPacket:          handler.Inject,
-		DialContext:       e.baseDialer.DialContext,
-		HeartbeatInterval: 500 * time.Millisecond,
-		Logf: func(format string, args ...any) {
-			log.Debugln("enagent[%s] "+format, append([]any{e.option.Name}, args...)...)
-		},
-	})
+	sess, err := e.connectTunnel(ctx, handler)
 	if err != nil {
-		// 握手失败常见原因是会话/token 过期，让下次重建时重新登录。
-		e.manager.Invalidate(true)
-		return nil, err
+		return nil, nil, err
 	}
 
 	auth := sess.Auth()
@@ -328,53 +260,90 @@ func (e *EnAgent) ensureStack(ctx context.Context) (*stack.Stack, error) {
 	})
 	if err != nil {
 		_ = sess.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	handler.set(st)
 
-	e.session = sess
-	e.stack = st
-	log.Infoln("enagent[%s]: 隧道就绪 虚拟IP=%s 网关=%s", e.option.Name, auth.VirtualIPv4, endpoint)
-	return st, nil
+	log.Infoln("enagent[%s]: 隧道就绪 虚拟IP=%s 网关=%s", e.option.Name, auth.VirtualIPv4, sess.GatewayHost())
+	return st, sess, nil
 }
 
-// invalidate 在链路出错时丢弃缓存，让下一次拨号重建。
-func (e *EnAgent) invalidate(cause error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.session != nil && !e.session.IsAlive() {
-		_ = e.session.Close()
-		e.session = nil
-	}
-	if e.stack != nil && e.session == nil {
-		_ = e.stack.Close()
-		e.stack = nil
-	}
+// invalidate 不因为单个目标连接失败而销毁共享隧道；死亡隧道由监控任务回收。
+func (e *enAgentState) invalidate(cause error) {
 	if cause != nil {
-		log.Debugln("enagent[%s]: 链路异常，等待重建: %v", e.option.Name, cause)
+		log.Debugln("enagent[%s]: 目标连接失败: %v", e.option.Name, cause)
 	}
-}
-
-func (e *EnAgent) username() string {
-	if e.option.Username != "" {
-		return e.option.Username
-	}
-	return e.manager.Username()
 }
 
 func (e *EnAgent) Close() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.session != nil {
-		_ = e.session.Close()
-		e.session = nil
-	}
-	if e.stack != nil {
-		_ = e.stack.Close()
-		e.stack = nil
-	}
-	if e.manager != nil {
-		e.manager.Close()
-	}
+	e.closeOnce.Do(func() { close(e.closed); releaseEnAgentState(e.shared) })
 	return nil
+}
+
+// connectTunnel 先复用 token；明确拒绝时最多刷新一次，并在同一次建连中重试。
+// 网络错误只尝试其他网关地址，不触发 CAS 登录。
+func (e *enAgentState) connectTunnel(ctx context.Context, handler *enAgentPacketHandler) (*session.Session, error) {
+	var lastErr error
+	for refresh := 0; refresh < 2; refresh++ {
+		rules, err := e.manager.EnsureRules(ctx, refresh != 0)
+		if err != nil {
+			return nil, err
+		}
+		rejected := false
+		seen := make(map[string]bool)
+		for _, endpoint := range rules.Servers {
+			if seen[endpoint.String()] {
+				continue
+			}
+			seen[endpoint.String()] = true
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if e.option.SPA {
+				port := rules.SPAPort
+				if port <= 0 {
+					port = spa.DefaultPort
+				}
+				knockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := spa.Knock(knockCtx, endpoint.Host, port, spa.Options{User: e.option.Username})
+				cancel()
+				if err != nil {
+					log.Warnln("enagent[%s]: SPA 敲门失败: %v", e.option.Name, err)
+				} else {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(enAgentSPAKnockDelay):
+					}
+				}
+			}
+			sess, err := session.Connect(ctx, session.Config{
+				Host: endpoint.Host, Port: endpoint.Port, User: e.option.Username, Token: rules.Token,
+				SkipCertVerify: e.option.SkipCertVerify, OnPacket: handler.Inject,
+				DialContext: e.baseDialer.DialContext, HandshakeRetries: 1,
+				HeartbeatInterval: 500 * time.Millisecond,
+				ReadTimeout:       time.Duration(e.option.HeartbeatTimeout) * time.Second,
+				Logf: func(format string, args ...any) {
+					log.Debugln("enagent[%s] "+format, append([]any{e.option.Name}, args...)...)
+				},
+			})
+			if err == nil {
+				return sess, nil
+			}
+			lastErr = err
+			var rejection *session.RejectedError
+			if errors.As(err, &rejection) {
+				rejected = true
+				break
+			}
+		}
+		if !rejected {
+			break
+		}
+		e.manager.Invalidate(false)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("enagent: 没有可用网关")
+	}
+	return nil, lastErr
 }

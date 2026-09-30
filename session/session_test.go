@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -431,8 +432,8 @@ func TestServerNameFollowsSNIRule(t *testing.T) {
 	if got := serverName(Config{Host: "client.vpn.nuist.edu.cn"}); got != "client.vpn.nuist.edu.cn" {
 		t.Errorf("域名 ServerName = %q", got)
 	}
-	if got := serverName(Config{Host: "202.195.225.220"}); got != "" {
-		t.Errorf("IP 不应带 SNI，实际 %q", got)
+	if got := serverName(Config{Host: "202.195.225.220"}); got != "202.195.225.220" {
+		t.Errorf("证书校验需要 IP；crypto/tls 自动省略其 SNI，实际 %q", got)
 	}
 	if got := serverName(Config{Host: "202.195.225.220", ServerName: "override.example"}); got != "override.example" {
 		t.Errorf("显式 ServerName 应生效，实际 %q", got)
@@ -452,5 +453,106 @@ func TestWithDefaults(t *testing.T) {
 	}
 	if cfg.HandshakeInterval != defaultHandshakeInterval {
 		t.Errorf("HandshakeInterval = %v", cfg.HandshakeInterval)
+	}
+}
+
+func TestAuthHandshakeCancellationAndTimeout(t *testing.T) {
+	for _, cancelEarly := range []bool{true, false} {
+		t.Run(fmt.Sprint(cancelEarly), func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			cfg := Config{User: testUser, Token: testToken, HandshakeTimeout: 150 * time.Millisecond}.withDefaults()
+			sess := &Session{cfg: cfg, conn: client}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			received := make(chan struct{})
+			go func() {
+				frame, _ := tunnel.BuildHandshake(testUser, testToken)
+				_, _ = io.ReadFull(server, make([]byte, len(frame)))
+				close(received)
+			}()
+			done := make(chan error, 1)
+			go func() { _, err := sess.authHandshake(ctx); done <- err }()
+			<-received
+			if cancelEarly {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("静默网关不应握手成功")
+				}
+				if cancelEarly && !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("应用层握手未及时退出")
+			}
+		})
+	}
+}
+
+func TestSilentGatewayExpiresAndWriteFailureCloses(t *testing.T) {
+	gw := newGateway(t, nil) // 持续读取心跳但从不应答。
+	sess, err := Connect(context.Background(), Config{
+		Host: gw.host, Port: gw.port, User: testUser, Token: testToken, SkipCertVerify: true,
+		HeartbeatInterval: 10 * time.Millisecond, ReadTimeout: 100 * time.Millisecond,
+		OnPacket: func([]byte) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	select {
+	case <-sess.Done():
+	case <-time.After(time.Second):
+		t.Fatal("静默网关未超时")
+	}
+	if sess.IsAlive() {
+		t.Fatal("超时隧道仍存活")
+	}
+	if err := sess.WriteIP(minimalIPPacket()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("关闭后写入: %v", err)
+	}
+}
+
+func TestBlockedWriteDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	sess := &Session{cfg: Config{WriteTimeout: 50 * time.Millisecond}.withDefaults(), conn: client, done: make(chan struct{})}
+	defer sess.Close()
+	done := make(chan error, 1)
+	go func() { done <- sess.WriteIP(minimalIPPacket()) }()
+	select {
+	case err := <-done:
+		if err == nil || sess.IsAlive() {
+			t.Fatalf("写超时未关闭隧道: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("发送无限阻塞")
+	}
+}
+
+func TestIncomingHeartbeatsKeepSessionAlive(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	sess := &Session{cfg: Config{ReadTimeout: 100 * time.Millisecond, OnPacket: func([]byte) error { return nil }}.withDefaults(), conn: client, done: make(chan struct{})}
+	defer sess.Close()
+	sess.wg.Add(1)
+	go sess.readLoop()
+	for i := 0; i < 10; i++ {
+		if _, err := server.Write([]byte{1, 2, 0, 8, 0, 0, 0, 0}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sess.IsAlive() {
+		t.Fatal("有持续心跳响应的隧道被误关")
+	}
+	select {
+	case <-sess.Done():
+	case <-time.After(time.Second):
+		t.Fatal("停止响应后未超时")
 	}
 }

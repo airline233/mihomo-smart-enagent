@@ -13,6 +13,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -81,6 +83,7 @@ type fakeEnv struct {
 	logins            int
 	rulesCalls        int
 	rulesWithoutToken int
+	rulesStatus       int
 	expired           bool
 	signatureVerified bool
 	logs              []string
@@ -152,7 +155,12 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fak
 		calls := env.rulesCalls
 		expired := env.expired
 		withoutToken := env.rulesWithoutToken
+		status := env.rulesStatus
 		env.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
 
 		if expired {
 			http.Redirect(w, r, "https://"+VPNDomain+VPNSsoLoginPath, http.StatusFound)
@@ -665,5 +673,229 @@ func TestSubmitFormEncoding(t *testing.T) {
 	form.Set("lt", "")
 	if got := form.Encode(); got != "lt=" {
 		t.Errorf("空值编码 = %q，期望 lt=", got)
+	}
+}
+
+func TestManagerPreservesSessionOnControllerFailure(t *testing.T) {
+	bundle, key := newTestBundle(t)
+	env := newFakeEnv(t, bundle, &key.PublicKey)
+	defer env.close()
+	env.rulesWithoutToken = 0
+	cache := FileCookieCache{Path: t.TempDir() + "/cookies.json"}
+	opts := ManagerOptions{Config: env.config(bundle), RulesAttempts: 1, MinLoginGap: time.Nanosecond, Cache: cache}
+	first, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := first.EnsureRules(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	env.mu.Lock()
+	env.rulesStatus = 503
+	env.mu.Unlock()
+	// 冷启动恢复与内存会话遇到 503 都不能重新登录。
+	second, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	for _, mgr := range []*Manager{first, second} {
+		if _, err := mgr.EnsureRules(context.Background(), true); err == nil {
+			t.Fatal("503 应返回错误")
+		}
+		if mgr.Session() == nil {
+			t.Fatal("临时错误不应清除 Session")
+		}
+	}
+	if env.loginCount() != 1 {
+		t.Fatalf("发生额外登录: %d", env.loginCount())
+	}
+	env.mu.Lock()
+	env.rulesStatus = 0
+	env.mu.Unlock()
+	if _, err := second.EnsureRules(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if env.loginCount() != 1 {
+		t.Fatal("网络恢复应复用原会话")
+	}
+}
+
+func TestCachedIdentityMustMatchAccount(t *testing.T) {
+	bundle, _ := newTestBundle(t)
+	bundle.UserID = passkey.UserIDFor("202599999999")
+	if _, err := NewSession(Config{Bundle: bundle}, map[string]string{"clientInfo": makeClientInfo(t)}); err == nil {
+		t.Fatal("不能恢复其他账号的 Cookie")
+	}
+}
+
+func TestManagerWaitingCallCanCancel(t *testing.T) {
+	bundle, _ := newTestBundle(t)
+	mgr, _ := NewManager(ManagerOptions{Config: Config{Bundle: bundle}})
+	defer mgr.Close()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := mgr.EnsureRules(ctx, false); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("等待状态锁时未响应取消")
+	}
+}
+
+func TestReloginClosesOldHTTPConnections(t *testing.T) {
+	bundle, key := newTestBundle(t)
+	env := newFakeEnv(t, bundle, &key.PublicKey)
+	defer env.close()
+	env.rulesWithoutToken = 0
+	var mu sync.Mutex
+	connections := 0
+	env.ctrlSrv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		if state == http.StateNew {
+			connections++
+		}
+		if state == http.StateClosed {
+			connections--
+		}
+	}
+	mgr, _ := NewManager(ManagerOptions{Config: env.config(bundle), RulesAttempts: 1, MinLoginGap: time.Nanosecond})
+	defer mgr.Close()
+	for i := 0; i < 2; i++ {
+		if _, err := mgr.EnsureRules(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		mgr.Invalidate(true)
+	}
+	mgr.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		mu.Lock()
+		n := connections
+		mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("遗留 %d 条控制器连接", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRenewResponseAndCookieRotation(t *testing.T) {
+	bundle, _ := newTestBundle(t)
+	var mu sync.Mutex
+	status, code := 200, "200"
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if r.Method != http.MethodPut || r.URL.Path != "/enlink/api/client/user/updateUserSession" {
+			t.Errorf("请求不匹配: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		sid := "initial"
+		if calls > 1 {
+			sid = "rotated"
+		}
+		if body["sessionId"] != sid || body["virtualIp"] != "1.1.8.51" || body["gateway"] != "gateway.test" {
+			t.Errorf("维护参数错误: %v", body)
+		}
+		cookie, err := r.Cookie("ENSSESSIONID")
+		if err != nil || cookie.Value != sid {
+			t.Errorf("Cookie 未随请求发送或轮换: %v", err)
+		}
+		if status != 200 {
+			w.WriteHeader(status)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "ENSSESSIONID", Value: "rotated", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": code})
+	}))
+	defer srv.Close()
+	cache := FileCookieCache{Path: t.TempDir() + "/cookies.json"}
+	cfg := Config{Bundle: bundle, Controller: srv.URL}
+	mgr, _ := NewManager(ManagerOptions{Config: cfg, Cache: cache})
+	defer mgr.Close()
+	sess, err := NewSession(cfg, map[string]string{"ENSSESSIONID": "initial", "clientInfo": makeClientInfo(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.session = sess
+	update := SessionUpdate{VirtualIP: "1.1.8.51", Gateway: "gateway.test"}
+	if err := mgr.Renew(context.Background(), update); err != nil {
+		t.Fatal(err)
+	}
+	cookies, _ := cache.Load()
+	if cookies["ENSSESSIONID"] != "rotated" {
+		t.Fatal("新 Cookie 未持久化")
+	}
+	for _, tc := range []struct {
+		status               int
+		code                 string
+		expired, unsupported bool
+	}{
+		{503, "200", false, false}, {200, "400", false, false}, {404, "200", false, true}, {200, "401", true, false},
+	} {
+		mu.Lock()
+		status, code = tc.status, tc.code
+		mu.Unlock()
+		err := mgr.Renew(context.Background(), update)
+		if err == nil {
+			t.Fatal("错误响应被当作成功")
+		}
+		if errors.Is(err, ErrSessionExpired) != tc.expired || errors.Is(err, ErrRenewUnsupported) != tc.unsupported {
+			t.Fatalf("错误分类: %v", err)
+		}
+		if (mgr.Session() == nil) != tc.expired {
+			t.Fatal("会话清除策略错误")
+		}
+	}
+}
+
+func TestManagerCloseCancelsActiveRequest(t *testing.T) {
+	bundle, _ := newTestBundle(t)
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg := Config{Bundle: bundle, Controller: srv.URL}
+	mgr, _ := NewManager(ManagerOptions{Config: cfg})
+	defer mgr.Close()
+	mgr.session, _ = NewSession(cfg, map[string]string{"ENSSESSIONID": "synthetic", "clientInfo": makeClientInfo(t)})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- mgr.Renew(ctx, SessionUpdate{VirtualIP: "1.1.8.51", Gateway: "gateway.test"}) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("未发出维护请求")
+	}
+	closed := make(chan struct{})
+	go func() { mgr.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close 未取消在途维护")
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("在途请求未取消: %v", err)
 	}
 }

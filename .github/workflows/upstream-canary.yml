@@ -70,6 +70,10 @@ jobs:
           go build -tags with_gvisor ./adapter/... ./constant/... \
             || { echo "::error::上游改动让 enagent 编译不过，需要更新 adapter"; exit 1; }
 
+      - name: EnAgent 会话与并发回归
+        working-directory: src/mihomo
+        run: go test -race -tags with_gvisor ./adapter/outbound -run '^TestEnAgent' -count=1 -timeout=60s
+
       - name: 完整二进制编译
         working-directory: src/mihomo
         env:

@@ -54,6 +54,12 @@ type Config struct {
 	HandshakeInterval time.Duration
 	// HeartbeatInterval 默认 500ms（原客户端周期）。
 	HeartbeatInterval time.Duration
+	// HandshakeTimeout 限制整个应用层握手（含重试），默认 10s。
+	HandshakeTimeout time.Duration
+	// ReadTimeout 是完整入站帧的最大等待时间，默认 30s；心跳响应也算入站。
+	ReadTimeout time.Duration
+	// WriteTimeout 限制单帧发送，默认 5s。
+	WriteTimeout time.Duration
 	// OnPacket 收到数据帧时回调，参数是**裸 IP 包**。
 	// 回调在读循环里同步执行，不要阻塞太久。
 	OnPacket func(packet []byte) error
@@ -77,6 +83,15 @@ func (c Config) withDefaults() Config {
 	if c.HeartbeatInterval <= 0 {
 		c.HeartbeatInterval = defaultHeartbeatInterval
 	}
+	if c.HandshakeTimeout <= 0 {
+		c.HandshakeTimeout = 10 * time.Second
+	}
+	if c.ReadTimeout <= 0 {
+		c.ReadTimeout = 30 * time.Second
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = 5 * time.Second
+	}
 	return c
 }
 
@@ -92,6 +107,7 @@ type Session struct {
 	auth tunnel.AuthInfo
 
 	conn net.Conn
+	raw  net.Conn
 
 	writeMu sync.Mutex
 	hbSeq   uint32
@@ -136,11 +152,12 @@ func Connect(ctx context.Context, cfg Config) (*Session, error) {
 	s := &Session{
 		cfg:  cfg,
 		conn: tlsConn,
+		raw:  raw,
 		done: make(chan struct{}),
 	}
 	auth, err := s.authHandshake(ctx)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	s.auth = auth
@@ -154,6 +171,8 @@ func Connect(ctx context.Context, cfg Config) (*Session, error) {
 }
 
 func dialTCP(ctx context.Context, cfg Config) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
+	defer cancel()
 	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	dial := cfg.DialContext
 	if dial == nil {
@@ -172,15 +191,43 @@ func serverName(cfg Config) string {
 	if cfg.ServerName != "" {
 		return cfg.ServerName
 	}
-	if net.ParseIP(cfg.Host) != nil {
-		return ""
-	}
+	// crypto/tls 自动省略 IP 的 SNI，但校验证书仍需要这个 IP。
 	return cfg.Host
+}
+
+// RejectedError 仅表示网关明确拒绝应用层鉴权，不包含拨号/TLS/超时错误。
+type RejectedError struct{ Code uint16 }
+
+func (e *RejectedError) Error() string {
+	return fmt.Sprintf("session: 握手失败 code=%04X（%s）", e.Code, tunnel.FailureReasonFor(e.Code))
 }
 
 // authHandshake 发送握手帧并解析网关下发的 TLV。
 // 失败时按原客户端策略重试：最多 5 次，每次间隔 1s，每次重新发送并重读 12 字节头。
-func (s *Session) authHandshake(ctx context.Context) (tunnel.AuthInfo, error) {
+func (s *Session) authHandshake(ctx context.Context) (auth tunnel.AuthInfo, resultErr error) {
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.HandshakeTimeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	if err := s.conn.SetDeadline(deadline); err != nil {
+		return auth, err
+	}
+	stop, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = s.conn.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-stopped
+		_ = s.conn.SetDeadline(time.Time{})
+		if ctx.Err() != nil {
+			resultErr = ctx.Err()
+		}
+	}()
 	frame, err := tunnel.BuildHandshake(s.cfg.User, s.cfg.Token)
 	if err != nil {
 		return tunnel.AuthInfo{}, err
@@ -202,13 +249,13 @@ func (s *Session) authHandshake(ctx context.Context) (tunnel.AuthInfo, error) {
 		if err != nil {
 			return tunnel.AuthInfo{}, fmt.Errorf("session: 读取握手响应失败: %w", err)
 		}
-		if resp.OK {
-			body := make([]byte, resp.BodyLen())
-			if len(body) > 0 {
-				if _, err := io.ReadFull(s.conn, body); err != nil {
-					return tunnel.AuthInfo{}, fmt.Errorf("session: 读取握手响应体失败: %w", err)
-				}
+		body := make([]byte, resp.BodyLen())
+		if len(body) > 0 {
+			if _, err := io.ReadFull(s.conn, body); err != nil {
+				return tunnel.AuthInfo{}, fmt.Errorf("session: 读取握手响应体失败: %w", err)
 			}
+		}
+		if resp.OK {
 			auth, err := tunnel.ParseAuthInfo(body)
 			if err != nil {
 				return tunnel.AuthInfo{}, err
@@ -228,8 +275,7 @@ func (s *Session) authHandshake(ctx context.Context) (tunnel.AuthInfo, error) {
 		case <-time.After(s.cfg.HandshakeInterval):
 		}
 	}
-	return tunnel.AuthInfo{}, fmt.Errorf("session: 握手失败，最后一次 code=%s（%s）",
-		lastCode, tunnel.FailureReasonFor(parseCode(lastCode)))
+	return tunnel.AuthInfo{}, &RejectedError{Code: parseCode(lastCode)}
 }
 
 func parseCode(code string) uint16 {
@@ -242,6 +288,9 @@ func parseCode(code string) uint16 {
 
 // Auth 返回握手时网关下发的参数（虚拟 IP / 掩码 / 网关 / DNS）。
 func (s *Session) Auth() tunnel.AuthInfo { return s.auth }
+
+// GatewayHost 返回实际连接的网关，用于控制器虚拟 IP 登记。
+func (s *Session) GatewayHost() string { return s.cfg.Host }
 
 // Done 在隧道断开时被关闭。
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -265,12 +314,31 @@ func (s *Session) WriteIP(packet []byte) error {
 	if err != nil {
 		return err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if _, err := s.conn.Write(frame); err != nil {
+	if err := s.writeFrame(frame); err != nil {
 		return fmt.Errorf("session: 发送数据帧失败: %w", err)
 	}
 	return nil
+}
+
+func (s *Session) writeFrame(frame []byte) error {
+	s.writeMu.Lock()
+	if !s.IsAlive() {
+		s.writeMu.Unlock()
+		return net.ErrClosed
+	}
+	err := s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+	if err == nil {
+		var n int
+		n, err = s.conn.Write(frame)
+		if err == nil && n != len(frame) {
+			err = io.ErrShortWrite
+		}
+	}
+	s.writeMu.Unlock()
+	if err != nil {
+		s.shutdown()
+	}
+	return err
 }
 
 // heartbeatLoop 周期发送心跳帧（+12..15 是 32 位递增计数器，小端）。
@@ -291,11 +359,9 @@ func (s *Session) heartbeatLoop() {
 }
 
 func (s *Session) sendHeartbeat() {
-	s.writeMu.Lock()
 	seq := s.hbSeq
 	s.hbSeq++
-	_, err := s.conn.Write(tunnel.BuildHeartbeat(seq))
-	s.writeMu.Unlock()
+	err := s.writeFrame(tunnel.BuildHeartbeat(seq))
 	if err != nil {
 		s.cfg.logf("session: 心跳发送失败: %v", err)
 		s.shutdown()
@@ -311,6 +377,10 @@ func (s *Session) sendHeartbeat() {
 func (s *Session) readLoop() {
 	defer s.wg.Done()
 	for {
+		if err := s.conn.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout)); err != nil {
+			s.shutdown()
+			return
+		}
 		hdr, err := tunnel.ReadResponseHeader(s.conn)
 		if err != nil {
 			select {
@@ -333,7 +403,7 @@ func (s *Session) readLoop() {
 			// 控制帧：不注入协议栈。
 			continue
 		}
-		if len(body) == 0 {
+		if len(body) == 0 || (hdr.Type != tunnel.TypeDataV4 && hdr.Type != tunnel.TypeDataV6) {
 			continue
 		}
 		if err := s.cfg.OnPacket(body); err != nil {
@@ -349,7 +419,9 @@ func (s *Session) readLoop() {
 func (s *Session) shutdown() {
 	s.closeOnce.Do(func() {
 		close(s.done)
-		if s.conn != nil {
+		if s.raw != nil {
+			s.closeErr = s.raw.Close() // 直接打断阻塞读写，不等待 TLS close_notify。
+		} else if s.conn != nil {
 			s.closeErr = s.conn.Close()
 		}
 	})

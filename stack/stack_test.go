@@ -28,6 +28,7 @@ func newCaptureSender() *captureSender {
 }
 
 func (s *captureSender) WriteIP(packet []byte) error {
+	packet = append([]byte(nil), packet...)
 	select {
 	case s.ch <- packet:
 	default:

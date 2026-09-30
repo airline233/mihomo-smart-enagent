@@ -41,7 +41,7 @@ const (
 
 // Sender 是协议栈出站 IP 包的出口，由隧道实现。
 type Sender interface {
-	// WriteIP 发送一个完整的裸 IP 包。
+	// WriteIP 同步发送一个完整裸 IP 包；如需保留 packet，必须自行复制。
 	WriteIP(packet []byte) error
 }
 
@@ -165,15 +165,13 @@ func (s *Stack) pump() {
 			return
 		}
 		view := pkt.ToView()
-		slice := view.AsSlice()
-		packet := make([]byte, len(slice))
-		copy(packet, slice)
-		view.Release()
 		pkt.DecRef()
 
-		if err := s.opts.Sender.WriteIP(packet); err != nil {
+		// Sender 同步消费数据，保留 view 到调用结束即可，不必再复制整包。
+		if err := s.opts.Sender.WriteIP(view.AsSlice()); err != nil {
 			s.opts.logf("stack: 发送 IP 包失败: %v", err)
 		}
+		view.Release()
 	}
 }
 

@@ -183,6 +183,9 @@ func (s *Session) fetchRulesOnce(ctx context.Context, rawURL string) (*Rules, er
 		return nil, fmt.Errorf("cas: terminal/rules 返回重定向 %d → %s", resp.StatusCode, truncate([]byte(location), 120))
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, ErrSessionExpired
+		}
 		return nil, fmt.Errorf("cas: terminal/rules 返回 HTTP %d: %s", resp.StatusCode, truncate(body, 200))
 	}
 	if bytes.Contains(body, []byte(VPNSsoLoginPath)) {
@@ -196,6 +199,9 @@ func (s *Session) fetchRulesOnce(ctx context.Context, rawURL string) (*Rules, er
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("cas: terminal/rules 响应不是 JSON: %w（%s）", err, truncate(body, 120))
+	}
+	if parsed.Code == "401" {
+		return nil, ErrSessionExpired
 	}
 	if parsed.Data == nil {
 		return nil, fmt.Errorf("cas: terminal/rules 没有 data（code=%q messages=%q）", parsed.Code, parsed.Messages)
@@ -248,7 +254,19 @@ func (c FileCookieCache) Store(cookies map[string]string) error {
 			return err
 		}
 	}
-	return os.WriteFile(c.Path, data, 0o600)
+	file, err := os.CreateTemp(filepath.Dir(c.Path), ".session-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), c.Path)
 }
 
 // ManagerOptions 是 Manager 的配置。
@@ -273,13 +291,55 @@ type ManagerOptions struct {
 type Manager struct {
 	opts ManagerOptions
 
-	mu        sync.Mutex
+	mu        contextMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
 	session   *Session
 	rules     *Rules
 	lastLogin time.Time
 	// forceLogin 为 true 时忽略磁盘上的 Cookie 缓存，直接重新登录。
 	// 它只在"已判定会话失效"后置位，冷启动时为 false。
 	forceLogin bool
+}
+
+// contextMutex 保留同步状态访问，同时允许网络调用的等待者及时取消。
+type contextMutex struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.once.Do(func() { m.ch = make(chan struct{}, 1) })
+	select {
+	case m.ch <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (m *contextMutex) Lock()   { _ = m.LockContext(context.Background()) }
+func (m *contextMutex) Unlock() { <-m.ch }
+
+// operationContext 同时受调用者和 Manager.Close 控制，兼容 Go 1.20。
+func (m *Manager) operationContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-m.ctx.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { cancel(); <-done }
 }
 
 // NewManager 构造 Manager。不会立刻登录。
@@ -298,7 +358,8 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 	if opts.MinLoginGap <= 0 {
 		opts.MinLoginGap = defaultMinLoginGap
 	}
-	return &Manager{opts: opts}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{opts: opts, ctx: ctx, cancel: cancel}, nil
 }
 
 // Session 返回当前会话，可能为 nil。
@@ -311,8 +372,15 @@ func (m *Manager) Session() *Session {
 // EnsureRules 返回可用的隧道参数，必要时自动重新登录。
 // force 为 true 时先丢弃缓存的 token。
 func (m *Manager) EnsureRules(ctx context.Context, force bool) (*Rules, error) {
-	m.mu.Lock()
+	ctx, cancel := m.operationContext(ctx)
+	defer cancel()
+	if err := m.mu.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.mu.Unlock()
+	if m.ctx.Err() != nil {
+		return nil, net.ErrClosed
+	}
 
 	if force {
 		m.rules = nil
@@ -328,12 +396,8 @@ func (m *Manager) EnsureRules(ctx context.Context, force bool) (*Rules, error) {
 			session, err := NewSession(m.opts.Config, cached)
 			if err != nil {
 				m.opts.Config.logf("cas: 缓存 Cookie 无法恢复会话: %v", err)
-			} else if rules, err := session.FetchRules(ctx, m.opts.RulesAttempts, m.opts.RulesInterval); err == nil {
-				m.session = session
-				m.rules = rules
-				return rules, nil
 			} else {
-				m.opts.Config.logf("cas: 缓存会话不可用，将重新登录: %v", err)
+				m.session = session
 			}
 		}
 	}
@@ -343,10 +407,13 @@ func (m *Manager) EnsureRules(ctx context.Context, force bool) (*Rules, error) {
 		rules, err := m.session.FetchRules(ctx, m.opts.RulesAttempts, m.opts.RulesInterval)
 		if err == nil {
 			m.rules = rules
+			m.storeCache(m.session.Cookies())
 			return rules, nil
 		}
-		m.opts.Config.logf("cas: 现有会话拉取 token 失败，重新登录: %v", err)
-		m.session = nil // 丢弃，避免下一步用同一个会话再失败一次
+		if !errors.Is(err, ErrSessionExpired) {
+			return nil, err
+		}
+		m.discardSessionLocked()
 	}
 
 	// 3) 重新登录后再拉。
@@ -358,6 +425,7 @@ func (m *Manager) EnsureRules(ctx context.Context, force bool) (*Rules, error) {
 		return nil, err
 	}
 	m.rules = rules
+	m.storeCache(m.session.Cookies())
 	return rules, nil
 }
 
@@ -368,15 +436,21 @@ func (m *Manager) Invalidate(sessionExpired bool) {
 	defer m.mu.Unlock()
 	m.rules = nil
 	if sessionExpired {
-		m.session = nil
-		m.forceLogin = true
+		m.discardSessionLocked()
 	}
 }
 
 // Login 强制重新登录并刷新 token。
 func (m *Manager) Login(ctx context.Context) (*Rules, error) {
-	m.mu.Lock()
+	ctx, cancel := m.operationContext(ctx)
+	defer cancel()
+	if err := m.mu.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.mu.Unlock()
+	if m.ctx.Err() != nil {
+		return nil, net.ErrClosed
+	}
 	if err := m.loginLocked(ctx); err != nil {
 		return nil, err
 	}
@@ -403,25 +477,26 @@ func (m *Manager) Username() string {
 
 // Close 释放 HTTP 连接池。
 func (m *Manager) Close() {
+	m.cancel()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session == nil {
-		return
+	m.discardSessionLocked()
+}
+
+func (m *Manager) discardSessionLocked() {
+	if m.session != nil {
+		m.session.Close()
 	}
-	for _, client := range []*http.Client{
-		m.session.followClient,
-		m.session.noFollowClient,
-		m.session.controllerClient,
-		m.session.controllerNoFollowClient,
-	} {
-		if client != nil {
-			client.CloseIdleConnections()
-		}
-	}
+	m.session = nil
+	m.rules = nil
+	m.forceLogin = true
 }
 
 // loginLocked 重新登录。调用方必须持有 m.mu。
 func (m *Manager) loginLocked(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !m.lastLogin.IsZero() {
 		if wait := m.opts.MinLoginGap - time.Since(m.lastLogin); wait > 0 {
 			m.opts.Config.logf("cas: 距上次登录仅 %s，等待 %s 以避免互相踢会话",
@@ -439,6 +514,9 @@ func (m *Manager) loginLocked(ctx context.Context) error {
 	m.lastLogin = time.Now()
 	if err != nil {
 		return err
+	}
+	if m.session != nil {
+		m.session.Close()
 	}
 	m.session = session
 	m.rules = nil

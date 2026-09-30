@@ -172,7 +172,9 @@ func (c Config) newHTTPClient(jar http.CookieJar, insecure bool, checkRedirect f
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: insecure, //nolint:gosec // 与参考实现一致，可配置
 		},
-		DialContext: c.DialContext,
+		DialContext:         c.DialContext,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	return &http.Client{
 		Jar:           jar,
@@ -209,14 +211,15 @@ func NewSession(cfg Config, cookies map[string]string) (*Session, error) {
 		return nil, err
 	}
 	if err := s.loadIdentity(); err != nil {
+		s.Close()
 		return nil, err
 	}
-	if name, err := cfg.Bundle.Username(); err == nil {
-		s.Username = name
+	name, err := cfg.Bundle.Username()
+	if err != nil || s.ClientInfo.Username != name {
+		s.Close()
+		return nil, errors.New("cas: 缓存会话账号与配置不一致")
 	}
-	if s.Username == "" {
-		s.Username = s.ClientInfo.Username
-	}
+	s.Username = name
 	return s, nil
 }
 
@@ -240,9 +243,19 @@ func Login(ctx context.Context, cfg Config) (*Session, error) {
 		controllerNoFollowClient: cfg.newHTTPClient(jar, cfg.ControllerSkipVerify, noRedirect),
 	}
 	if err := s.login(ctx); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// Close 释放本会话的全部 HTTP 连接池；可重复调用。
+func (s *Session) Close() {
+	for _, client := range []*http.Client{s.followClient, s.noFollowClient, s.controllerClient, s.controllerNoFollowClient} {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
+	}
 }
 
 // vpnCookieURL 是 VPN 域 Cookie 的作用域。

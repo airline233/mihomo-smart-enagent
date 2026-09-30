@@ -17,15 +17,17 @@ type EnAgent struct {
 // 解出来的配置不同。
 type EnAgentOption struct {
 	BasicOption
-	Name           string         `proxy:"name"`
-	Server         string         `proxy:"server"`
-	Port           int            `proxy:"port,omitempty"`
-	Username       string         `proxy:"username,omitempty"`
-	Passkey        map[string]any `proxy:"passkey"`
-	SPA            bool           `proxy:"spa,omitempty"`
-	SkipCertVerify bool           `proxy:"skip-cert-verify,omitempty"`
-	StateDir       string         `proxy:"state-dir,omitempty"`
-	UDP            bool           `proxy:"udp,omitempty"`
+	Name             string         `proxy:"name"`
+	Server           string         `proxy:"server"`
+	Port             int            `proxy:"port,omitempty"`
+	Username         string         `proxy:"username,omitempty"`
+	Passkey          map[string]any `proxy:"passkey"`
+	SPA              bool           `proxy:"spa,omitempty"`
+	SkipCertVerify   bool           `proxy:"skip-cert-verify,omitempty"`
+	StateDir         string         `proxy:"state-dir,omitempty"`
+	UDP              bool           `proxy:"udp,omitempty"`
+	RenewInterval    int            `proxy:"renew-interval,omitempty"`
+	HeartbeatTimeout int            `proxy:"heartbeat-timeout,omitempty"`
 }
 
 // NewEnAgent 在未启用 with_gvisor 时直接报错。
