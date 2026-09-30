@@ -1,0 +1,65 @@
+name: module-ci
+
+# 只验证 enagent 模块本身：纯标准库 + gvisor，全套单测离线可跑。
+# 注意：这里跑不了真机联通测试（需要校园网 + 真实账号 + passkey bundle）。
+#
+# mihomo 的 clone + patch + 编译走 build.yml。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/module-ci.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/module-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / go${{ matrix.go }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 1.20 是 mihomo 声明的 go 版本，必须保证仍然可编译。
+        go: ['1.20', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^_integration/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+      - name: go test -race
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./... -count=1 -race

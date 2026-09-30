@@ -1,0 +1,31 @@
+# ---- 凭据：绝不入库 ----
+# passkey bundle 现在内联在 mihomo 的 config.yaml 里，这两条是防手滑。
+passkey*.json
+*.local.json
+vpn_cookies.json
+nuist_cookies.*
+cookies.txt
+session-cookies.json
+
+# ---- 本地构建产物 ----
+# mihomo 源码不进仓库：构建脚本 clone 到 .build/ 下，产物放 dist/。
+/.build/
+/dist/
+/bin/
+/.cache/
+*.exe
+*.test
+*.prof
+
+# ---- Python（_integration 里的向量生成脚本）----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,53 @@
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 651f4cc..983200b 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -202,6 +202,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 			break
+ 		}
+ 		proxy, err = outbound.NewTailscale(*tailscaleOption)
++	case "enagent":
++		enAgentOption := &outbound.EnAgentOption{BasicOption: basicOption}
++		err = decoder.Decode(mapping, enAgentOption)
++		if err != nil {
++			break
++		}
++		proxy, err = outbound.NewEnAgent(*enAgentOption)
+ 	default:
+ 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
+ 	}
+diff --git a/constant/adapters.go b/constant/adapters.go
+index 36088ea..77e9b3b 100644
+--- a/constant/adapters.go
++++ b/constant/adapters.go
+@@ -53,6 +53,7 @@ const (
+ 	OpenVPN
+ 	Tailscale
+ 	GostRelay
++	EnAgent
+ )
+ 
+ const (
+@@ -236,6 +237,8 @@ func (at AdapterType) String() string {
+ 		return "Tailscale"
+ 	case GostRelay:
+ 		return "GostRelay"
++	case EnAgent:
++		return "EnAgent"
+ 	case Relay:
+ 		return "Relay"
+ 	case Selector:
+diff --git a/go.mod b/go.mod
+index cdc9e13..4d02eb2 100644
+--- a/go.mod
++++ b/go.mod
+@@ -152,3 +152,9 @@ require (
+ 
+ // for https://github.com/golang/protobuf/issues/1704
+ replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
++
++// EnAgent outbound（NUIST SDP/Enlink 零信任 VPN）。
++// enagent 是本地模块：构建脚本会把仓库里的 enagent/ 拷到源码树根目录下。
++require github.com/airline233/mihomo-smart-enagent v0.1.0
++
++replace github.com/airline233/mihomo-smart-enagent => ./enagent

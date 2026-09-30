@@ -1,0 +1,18 @@
+# 统一按 LF 存储与检出。
+#
+# 这条对本仓库特别关键：_integration/patches/*.patch 是 git apply 的输入，一旦被
+# 检出成 CRLF，补丁上下文就匹配不上上游源码（上游是 LF），构建会以
+# "patch does not apply" 失败。Windows 上 core.autocrlf=true 时默认就会这样，
+# 所以必须显式钉死，而不是指望每台机器的 git 配置。
+* text=auto eol=lf
+
+# 补丁与 shell 脚本严格按 LF 处理，不做任何转换。
+*.patch -text
+*.sh text eol=lf
+
+# 二进制产物不参与行尾转换
+*.exe binary
+*.gz binary
+*.zip binary
+*.png binary
+*.ico binary
