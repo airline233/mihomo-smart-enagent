@@ -24,7 +24,6 @@ import (
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
 	"github.com/metacubex/gvisor/pkg/tcpip/network/ipv4"
-	"github.com/metacubex/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
@@ -57,8 +56,6 @@ type Options struct {
 	VirtualIPv4 netip.Addr
 	// PrefixLen 是子网前缀长度（由网关下发的掩码换算而来）。
 	PrefixLen int
-	// VirtualIPv6 可选。IPv6 数据面尚未证实可用，留空即不启用。
-	VirtualIPv6 netip.Addr
 	// MTU 默认 1500。
 	MTU uint32
 	// Sender 是出站 IP 包的出口，必填。
@@ -107,7 +104,10 @@ func New(opts Options) (*Stack, error) {
 
 	link := channel.New(channelDepth, mtu, "")
 	netStack := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		// 网关把隧道 DNS 暴露为 127.0.0.1；必须接收它经隧道返回的回环源地址包。
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
+		},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		// 允许访问本机地址，否则某些回环场景会被内核直接拒绝。
 		HandleLocal: true,
@@ -125,22 +125,9 @@ func New(opts Options) (*Stack, error) {
 	}, stack.AddressProperties{}); err != nil {
 		return nil, fmt.Errorf("stack: 配置虚拟 IPv4 失败: %v", err)
 	}
-	if opts.VirtualIPv6.IsValid() && opts.VirtualIPv6.Is6() {
-		if err := netStack.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
-			Protocol: ipv6.ProtocolNumber,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.AddrFromSlice(opts.VirtualIPv6.AsSlice()),
-				PrefixLen: 128,
-			},
-		}, stack.AddressProperties{}); err != nil {
-			// IPv6 配不上不算致命：数据面本来就还没证实。
-			opts.logf("stack: 配置虚拟 IPv6 失败（忽略）: %v", err)
-		}
-	}
 	// 默认路由全部指向隧道。
 	netStack.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
-		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,7 +172,7 @@ func (s *Stack) InjectIP(packet []byte) error {
 	case 4:
 		networkProtocol = ipv4.ProtocolNumber
 	case 6:
-		networkProtocol = ipv6.ProtocolNumber
+		return errors.New("stack: IPv6 已禁用")
 	default:
 		return fmt.Errorf("stack: 不是 IP 包（首字节 %#02x）", packet[0])
 	}
@@ -204,7 +191,7 @@ func (s *Stack) InjectIP(packet []byte) error {
 // mihomo 的 DNS 模块不会把域名透传下来（透传会造成隧道内 DNS 环路）。
 func (s *Stack) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {
-	case "tcp", "tcp4", "tcp6", "":
+	case "tcp", "tcp4", "":
 	default:
 		return nil, fmt.Errorf("stack: 不支持的网络类型 %q", network)
 	}
@@ -212,15 +199,14 @@ func (s *Stack) DialContext(ctx context.Context, network, address string) (net.C
 	if err != nil {
 		return nil, fmt.Errorf("stack: 需要数字地址 host:port，收到 %q: %w", address, err)
 	}
-	networkProtocol := ipv4.ProtocolNumber
-	if addrPort.Addr().Is6() {
-		networkProtocol = ipv6.ProtocolNumber
+	if !addrPort.Addr().Unmap().Is4() {
+		return nil, errors.New("stack: IPv6 已禁用")
 	}
 	conn, err := gonet.DialContextTCP(ctx, s.stack, tcpip.FullAddress{
 		NIC:  nicID,
-		Addr: tcpip.AddrFromSlice(addrPort.Addr().AsSlice()),
+		Addr: tcpip.AddrFromSlice(addrPort.Addr().Unmap().AsSlice()),
 		Port: addrPort.Port(),
-	}, networkProtocol)
+	}, ipv4.ProtocolNumber)
 	if err != nil {
 		return nil, fmt.Errorf("stack: 建立 TCP 连接失败: %w", err)
 	}
@@ -238,16 +224,13 @@ func (s *Stack) ListenPacket(ctx context.Context, network, address string) (net.
 	case "udp", "udp4", "":
 		networkProtocol = ipv4.ProtocolNumber
 		localAddr.Addr = tcpip.AddrFromSlice(s.opts.VirtualIPv4.AsSlice())
-	case "udp6":
-		if !s.opts.VirtualIPv6.IsValid() {
-			return nil, errors.New("stack: 未配置虚拟 IPv6")
-		}
-		networkProtocol = ipv6.ProtocolNumber
-		localAddr.Addr = tcpip.AddrFromSlice(s.opts.VirtualIPv6.AsSlice())
 	default:
 		return nil, fmt.Errorf("stack: 不支持的 UDP 网络类型 %q", network)
 	}
 	if addrPort, err := netip.ParseAddrPort(address); err == nil {
+		if !addrPort.Addr().Unmap().Is4() {
+			return nil, errors.New("stack: IPv6 已禁用")
+		}
 		localAddr.Port = addrPort.Port()
 	}
 

@@ -67,6 +67,13 @@ func newTestStack(t *testing.T) (*Stack, *captureSender) {
 // TestUDPRoundTripThroughStack 是这一层最有价值的验证：出站包真的带着虚拟源地址
 // 走出协议栈，入站包真的能被注入并被已绑定的 UDP 端点收到。
 func TestUDPRoundTripThroughStack(t *testing.T) {
+	for _, peerIP := range []string{testPeerIP, "127.0.0.1"} {
+		t.Run(peerIP, func(t *testing.T) { testUDPRoundTripThroughStack(t, peerIP) })
+	}
+}
+
+func testUDPRoundTripThroughStack(t *testing.T, peerIP string) {
+	t.Helper()
 	st, sender := newTestStack(t)
 	ctx := context.Background()
 
@@ -77,7 +84,7 @@ func TestUDPRoundTripThroughStack(t *testing.T) {
 	defer pc.Close()
 
 	virtualAddr := netip.MustParseAddr(testVirtualIP)
-	peerAddr := netip.MustParseAddr(testPeerIP)
+	peerAddr := netip.MustParseAddr(peerIP)
 	peer := net.UDPAddrFromAddrPort(netip.AddrPortFrom(peerAddr, testPeerPort))
 
 	if _, err := pc.WriteTo([]byte("ping-dns"), peer); err != nil {
@@ -221,6 +228,39 @@ func TestInjectIPRejectsGarbage(t *testing.T) {
 	}
 	if err := st.InjectIP([]byte{0x00, 0x01, 0x02}); err == nil {
 		t.Error("非 IP 包应报错")
+	}
+	if err := st.InjectIP(append([]byte{0x60}, make([]byte, 39)...)); err == nil {
+		t.Error("IPv6 入站包应被拒绝")
+	}
+}
+
+func TestIPv6Disabled(t *testing.T) {
+	st, sender := newTestStack(t)
+	ctx := context.Background()
+	for _, network := range []string{"tcp", "tcp4", "tcp6"} {
+		if conn, err := st.DialContext(ctx, network, "[2001:db8::1]:443"); err == nil {
+			conn.Close()
+			t.Errorf("%s 允许了 IPv6", network)
+		}
+	}
+	for _, network := range []string{"udp", "udp4", "udp6"} {
+		if pc, err := st.ListenPacket(ctx, network, "[::]:0"); err == nil {
+			pc.Close()
+			t.Errorf("%s 允许了 IPv6", network)
+		}
+	}
+	pc, err := st.ListenPacket(ctx, "udp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.WriteTo([]byte("ipv6"), net.UDPAddrFromAddrPort(netip.MustParseAddrPort("[2001:db8::1]:53"))); err == nil {
+		t.Fatal("IPv4 UDP 端点允许发送到 IPv6")
+	}
+	select {
+	case <-sender.ch:
+		t.Fatal("禁用 IPv6 后仍发出了数据包")
+	default:
 	}
 }
 

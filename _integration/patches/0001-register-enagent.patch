@@ -7,7 +7,7 @@ index 651f4cc..983200b 100644
  		}
  		proxy, err = outbound.NewTailscale(*tailscaleOption)
 +	case "enagent":
-+		enAgentOption := &outbound.EnAgentOption{BasicOption: basicOption}
++		enAgentOption := &outbound.EnAgentOption{BasicOption: basicOption, UDP: true}
 +		err = decoder.Decode(mapping, enAgentOption)
 +		if err != nil {
 +			break

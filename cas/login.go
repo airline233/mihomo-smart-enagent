@@ -37,7 +37,7 @@ const (
 	AuthServerNormal = "https://authserver.nuist.edu.cn"
 	// ControllerNormal 是 Enlink 控制器地址。
 	ControllerNormal = "https://client.vpn.nuist.edu.cn"
-	// VPNCASCallback 是控制器的 CAS 回调，必须作为登录的 service 参数。
+	// VPNCASCallback 是默认控制器的 CAS 回调；自定义控制器时使用对应地址。
 	VPNCASCallback = ControllerNormal + "/enlink/api/client/callback/cas"
 	// VPNDomain 是会话 Cookie 所属的域。
 	VPNDomain = "client.vpn.nuist.edu.cn"
@@ -78,7 +78,7 @@ type Config struct {
 	// AuthServer 是统一身份认证地址，默认 AuthServerNormal。
 	// 覆盖它可以指向 httptest 服务，用于离线测试。
 	AuthServer string
-	// Controller 是 Enlink 控制器地址，默认 ControllerNormal。
+	// Controller 是 Enlink 控制器地址（可带端口），默认 ControllerNormal。
 	Controller string
 	// UserAgent 默认与参考实现一致的 Firefox UA。
 	UserAgent string
@@ -114,6 +114,14 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	c.AuthServer = strings.TrimRight(c.AuthServer, "/")
 	c.Controller = strings.TrimRight(c.Controller, "/")
+	controller, err := url.Parse(c.Controller)
+	if err != nil || controller.Scheme != "https" || controller.Hostname() == "" {
+		return c, errors.New("cas: 控制器地址必须是有效的 HTTPS URL")
+	}
+	if controller.Port() == "443" {
+		controller.Host = strings.TrimSuffix(controller.Host, ":443")
+	}
+	c.Controller = controller.String()
 	if c.UserAgent == "" {
 		c.UserAgent = defaultUserAgent
 	}
@@ -305,7 +313,7 @@ func (s *Session) loadIdentity() error {
 
 // login 执行 CAS + WebAuthn 断言流程。
 func (s *Session) login(ctx context.Context) error {
-	loginURL := s.loginURL(VPNCASCallback)
+	loginURL := s.loginURL(s.cfg.Controller + "/enlink/api/client/callback/cas")
 	s.cfg.logf("cas: 访问登录页 %s", loginURL)
 
 	execution, landed, err := s.openLoginPage(ctx, loginURL)

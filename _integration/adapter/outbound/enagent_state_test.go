@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/airline233/mihomo-smart-enagent/cas"
 	"github.com/airline233/mihomo-smart-enagent/stack"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 type enAgentLocalDialer struct {
@@ -81,6 +83,13 @@ func enAgentFixture(t *testing.T, block bool, modes ...string) (EnAgentOption, *
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": "200", "data": map[string]any{"token": "test-token", "server": gateway}})
 		case "/enlink/api/client/user/updateUserSession":
 			renew.Add(1)
+			var update cas.SessionUpdate
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				t.Error(err)
+			}
+			if update.VirtualIPv6 != "" {
+				t.Error("IPv6 已禁用，不应向控制器登记 IPv6 地址")
+			}
 			if mode == "unsupported" {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -120,16 +129,28 @@ func enAgentFixture(t *testing.T, block bool, modes ...string) (EnAgentOption, *
 					if n < 0 {
 						return
 					}
-					if _, err := io.CopyN(io.Discard, conn, int64(n)); err != nil {
+					body := make([]byte, n)
+					if _, err := io.ReadFull(conn, body); err != nil {
 						return
 					}
-					if hdr[8] == 1 {
+					if hdr[1] == 4 && len(body) >= 28 && body[0] == 0x45 && body[9] == 17 {
+						// IPv4 UDP echo：交换地址和端口不会改变 IP/UDP 校验和。
+						src := append([]byte(nil), body[12:16]...)
+						copy(body[12:16], body[16:20])
+						copy(body[16:20], src)
+						body[20], body[21], body[22], body[23] = body[22], body[23], body[20], body[21]
+						reply := append([]byte{1, 4, 0, 0, 0, 0, 0, 0}, body...)
+						binary.BigEndian.PutUint16(reply[2:4], uint16(len(reply)))
+						_, err = conn.Write(reply)
+					} else if hdr[8] == 1 {
 						if mode == "reject" && connections.Load() == 1 {
 							_, _ = conn.Write([]byte{1, 2, 0, 12, 0, 0, 0, 0, 1, 0, 0x80, 0})
 							return
 						}
-						// 12 字节握手响应头 + IPv4 TLV + 结束符。
-						_, err = conn.Write([]byte{1, 2, 0, 20, 0, 0, 0, 0, 1, 0, 0, 0, 0x0b, 0, 4, 1, 1, 8, 51, 0xff})
+						// 网关同时下发 IPv4/IPv6；客户端必须只启用 IPv4。
+						reply := []byte{1, 2, 0, 39, 0, 0, 0, 0, 1, 0, 0, 0, 0x0b, 0, 4, 1, 1, 8, 51, 0x35, 0, 16}
+						reply = append(reply, netip.MustParseAddr("2001:db8::51").AsSlice()...)
+						_, err = conn.Write(append(reply, 0xff))
 					} else {
 						_, err = conn.Write([]byte{1, 2, 0, 8, 0, 0, 0, 0})
 					}
@@ -235,6 +256,91 @@ func TestEnAgentSharesTunnelAndKeepsItOnRenewFailure(t *testing.T) {
 	case <-second.shared.stopped:
 	default:
 		t.Fatal("最后一个节点关闭后未回收")
+	}
+}
+
+func TestEnAgentUDPRoundTripAndIPv6Disabled(t *testing.T) {
+	option, connections, _, _ := enAgentFixture(t, false)
+	option.UDP = true
+	option.IPVersion = C.IPv6Only
+	e := enAgentWithCache(t, option)
+	if !e.SupportUDP() || e.option.IPVersion != C.IPv4Only {
+		t.Fatal("UDP 或强制 IPv4 配置未生效")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	v6 := &C.Metadata{DstIP: netip.MustParseAddr("2001:db8::1"), DstPort: 53}
+	if _, err := e.ListenPacketContext(ctx, v6); err == nil {
+		t.Fatal("UDP 接受了 IPv6")
+	}
+	if _, err := e.DialContext(ctx, v6); err == nil {
+		t.Fatal("TCP 接受了 IPv6")
+	}
+	if connections.Load() != 0 {
+		t.Fatal("拒绝 IPv6 前不应建立隧道")
+	}
+	pc, err := e.ListenPacketContext(ctx, &C.Metadata{DstIP: netip.MustParseAddr("192.0.2.53"), DstPort: 53})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	for _, target := range []string{"192.0.2.53:53", "127.0.0.1:53"} {
+		peer := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(target))
+		if err := pc.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pc.WriteTo([]byte("udp-through-tls"), peer); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 128)
+		n, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(buf[:n]) != "udp-through-tls" || from.String() != target {
+			t.Fatalf("UDP 回包不匹配: %q from %s", buf[:n], from)
+		}
+	}
+	option.Name = "UDP disabled"
+	option.UDP = false
+	disabled, err := NewEnAgent(option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disabled.Close()
+	if disabled.SupportUDP() {
+		t.Fatal("udp: false 未生效")
+	}
+	if _, err := disabled.ListenPacketContext(ctx, &C.Metadata{DstIP: netip.MustParseAddr("192.0.2.53"), DstPort: 53}); err == nil {
+		t.Fatal("禁用 UDP 后仍允许建连")
+	}
+}
+
+func TestEnAgentControllerPorts(t *testing.T) {
+	option, _, _, _ := enAgentFixture(t, false)
+	option.Server = "vpn.example"
+	for _, port := range []int{0, 443, 8443, -1, 65536} {
+		option.Port = port
+		e, err := NewEnAgent(option)
+		if port < 0 || port > 65535 {
+			if err == nil {
+				e.Close()
+				t.Fatalf("非法端口 %d 未被拒绝", port)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		controller := "https://vpn.example"
+		if port == 8443 {
+			controller += ":8443"
+		}
+		want := fmt.Sprintf("%x", sha256.Sum256([]byte(controller+"\x00"+e.option.Username)))
+		if e.shared.key != want {
+			t.Errorf("端口 %d 未使用预期控制器地址 %s", port, controller)
+		}
+		e.Close()
 	}
 }
 

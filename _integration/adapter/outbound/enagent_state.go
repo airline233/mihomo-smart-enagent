@@ -58,6 +58,9 @@ type enAgentState struct {
 
 func acquireEnAgentState(option EnAgentOption, bundle *passkey.Bundle, dialer C.Dialer) (*enAgentState, error) {
 	controller := "https://" + net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
+	if option.Port == defaultEnAgentPort {
+		controller = "https://" + option.Server
+	}
 	identity := sha256.Sum256([]byte(controller + "\x00" + option.Username))
 	key := fmt.Sprintf("%x", identity)
 	// 不允许同账号节点悄悄忽略不同的路由、凭据和 TLS 配置。
@@ -258,9 +261,6 @@ func (e *enAgentState) maintain(st *stack.Stack, sess *session.Session) {
 		case <-timer.C:
 			auth := sess.Auth()
 			req := cas.SessionUpdate{VirtualIP: auth.VirtualIPv4.String(), Gateway: sess.GatewayHost()}
-			if auth.VirtualIPv6.IsValid() {
-				req.VirtualIPv6 = auth.VirtualIPv6.String()
-			}
 			renewCtx, stop := context.WithTimeout(ctx, defaultEnAgentTimeout)
 			err := e.manager.Renew(renewCtx, req)
 			stop()

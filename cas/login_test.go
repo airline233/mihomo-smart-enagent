@@ -89,7 +89,7 @@ type fakeEnv struct {
 	logs              []string
 }
 
-func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fakeEnv {
+func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey, configureController ...func(*http.Server)) *fakeEnv {
 	t.Helper()
 	env := &fakeEnv{clientInfo: makeClientInfo(t), rulesWithoutToken: 1}
 
@@ -97,8 +97,8 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fak
 	authMux.HandleFunc(loginPath, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			if got := r.URL.Query().Get("service"); got != VPNCASCallback {
-				t.Errorf("service 参数 = %q，期望 %q", got, VPNCASCallback)
+			if got, want := r.URL.Query().Get("service"), env.ctrlSrv.URL+"/enlink/api/client/callback/cas"; got != want {
+				t.Errorf("service 参数 = %q，期望 %q", got, want)
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = fmt.Fprint(w, `<html><body><input name="execution" value="test-exec"/></body></html>`)
@@ -141,7 +141,7 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fak
 			},
 		})
 	})
-	env.authSrv = httptest.NewServer(authMux)
+	env.authSrv = httptest.NewTLSServer(authMux)
 
 	ctrlMux := http.NewServeMux()
 	ctrlMux.HandleFunc("/enlink/api/client/callback/cas", func(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +178,11 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fak
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"code": "200", "data": data})
 	})
-	env.ctrlSrv = httptest.NewServer(ctrlMux)
+	env.ctrlSrv = httptest.NewUnstartedServer(ctrlMux)
+	for _, configure := range configureController {
+		configure(env.ctrlSrv.Config)
+	}
+	env.ctrlSrv.StartTLS()
 	return env
 }
 
@@ -186,6 +190,12 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey) *fak
 // 检查 authenticatorData 布局，并用公钥验证 DER 签名。
 func (e *fakeEnv) handleSubmit(t *testing.T, w http.ResponseWriter, r *http.Request, bundle *passkey.Bundle, pub *ecdsa.PublicKey) {
 	t.Helper()
+	service := r.URL.Query().Get("service")
+	if want := e.ctrlSrv.URL + "/enlink/api/client/callback/cas"; service != want {
+		t.Errorf("提交断言 service = %q，期望 %q", service, want)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		t.Errorf("解析表单失败: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
@@ -306,7 +316,7 @@ func (e *fakeEnv) handleSubmit(t *testing.T, w http.ResponseWriter, r *http.Requ
 	e.signatureVerified = true
 	e.mu.Unlock()
 
-	http.Redirect(w, r, e.ctrlSrv.URL+"/enlink/api/client/callback/cas", http.StatusFound)
+	http.Redirect(w, r, service, http.StatusFound)
 }
 
 func (e *fakeEnv) logf(format string, args ...any) {
@@ -328,10 +338,12 @@ func (e *fakeEnv) close() {
 
 func (e *fakeEnv) config(bundle *passkey.Bundle) Config {
 	return Config{
-		Bundle:     bundle,
-		AuthServer: e.authSrv.URL,
-		Controller: e.ctrlSrv.URL,
-		Logf:       e.logf,
+		Bundle:               bundle,
+		AuthServer:           e.authSrv.URL,
+		Controller:           e.ctrlSrv.URL,
+		AuthServerInsecure:   true,
+		ControllerSkipVerify: true,
+		Logf:                 e.logf,
 	}
 }
 
@@ -648,6 +660,38 @@ func TestNewSessionRequiresClientInfo(t *testing.T) {
 	}
 }
 
+func TestControllerHTTPSAndPort(t *testing.T) {
+	bundle, _ := newTestBundle(t)
+	for _, tc := range []struct {
+		controller string
+		want       string
+	}{
+		{"", ControllerNormal},
+		{ControllerNormal, ControllerNormal},
+		{ControllerNormal + ":443", ControllerNormal},
+		{ControllerNormal + ":8443/", ControllerNormal + ":8443"},
+		{"https://vpn.example:10443", "https://vpn.example:10443"},
+		{"https://[::1]:8443", "https://[::1]:8443"},
+		{"https://[::1]:443", "https://[::1]"},
+		{"http://127.0.0.1:18080", ""},
+		{"vpn.example:8443", ""},
+		{"https://[invalid", ""},
+	} {
+		t.Run(tc.controller, func(t *testing.T) {
+			cfg, err := (Config{Bundle: bundle, Controller: tc.controller}).withDefaults()
+			if tc.want == "" {
+				if err == nil {
+					t.Fatal("无效控制器地址应报错")
+				}
+				return
+			}
+			if err != nil || cfg.Controller != tc.want {
+				t.Fatalf("Controller = %q, %v；期望 %q", cfg.Controller, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveURL(t *testing.T) {
 	got, err := resolveURL("https://a.example.com/authserver/login?service=x", "/enlink/api/client/callback/cas")
 	if err != nil {
@@ -752,21 +796,22 @@ func TestManagerWaitingCallCanCancel(t *testing.T) {
 
 func TestReloginClosesOldHTTPConnections(t *testing.T) {
 	bundle, key := newTestBundle(t)
-	env := newFakeEnv(t, bundle, &key.PublicKey)
-	defer env.close()
-	env.rulesWithoutToken = 0
 	var mu sync.Mutex
 	connections := 0
-	env.ctrlSrv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		mu.Lock()
-		defer mu.Unlock()
-		if state == http.StateNew {
-			connections++
+	env := newFakeEnv(t, bundle, &key.PublicKey, func(srv *http.Server) {
+		srv.ConnState = func(_ net.Conn, state http.ConnState) {
+			mu.Lock()
+			defer mu.Unlock()
+			if state == http.StateNew {
+				connections++
+			}
+			if state == http.StateClosed {
+				connections--
+			}
 		}
-		if state == http.StateClosed {
-			connections--
-		}
-	}
+	})
+	defer env.close()
+	env.rulesWithoutToken = 0
 	mgr, _ := NewManager(ManagerOptions{Config: env.config(bundle), RulesAttempts: 1, MinLoginGap: time.Nanosecond})
 	defer mgr.Close()
 	for i := 0; i < 2; i++ {
@@ -796,7 +841,7 @@ func TestRenewResponseAndCookieRotation(t *testing.T) {
 	var mu sync.Mutex
 	status, code := 200, "200"
 	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
@@ -827,7 +872,7 @@ func TestRenewResponseAndCookieRotation(t *testing.T) {
 	}))
 	defer srv.Close()
 	cache := FileCookieCache{Path: t.TempDir() + "/cookies.json"}
-	cfg := Config{Bundle: bundle, Controller: srv.URL}
+	cfg := Config{Bundle: bundle, Controller: srv.URL, ControllerSkipVerify: true}
 	mgr, _ := NewManager(ManagerOptions{Config: cfg, Cache: cache})
 	defer mgr.Close()
 	sess, err := NewSession(cfg, map[string]string{"ENSSESSIONID": "initial", "clientInfo": makeClientInfo(t)})
@@ -869,13 +914,13 @@ func TestRenewResponseAndCookieRotation(t *testing.T) {
 func TestManagerCloseCancelsActiveRequest(t *testing.T) {
 	bundle, _ := newTestBundle(t)
 	started := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		close(started)
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
-	cfg := Config{Bundle: bundle, Controller: srv.URL}
+	cfg := Config{Bundle: bundle, Controller: srv.URL, ControllerSkipVerify: true}
 	mgr, _ := NewManager(ManagerOptions{Config: cfg})
 	defer mgr.Close()
 	mgr.session, _ = NewSession(cfg, map[string]string{"ENSSESSIONID": "synthetic", "clientInfo": makeClientInfo(t)})

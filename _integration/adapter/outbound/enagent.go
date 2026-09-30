@@ -70,7 +70,7 @@ type EnAgentOption struct {
 	// StateDir 可选：会话 Cookie 缓存目录，用于跨重启复用会话、避免每次重启都跑
 	// CAS 登录。留空使用系统缓存目录；缓存按控制器和账号隔离。
 	StateDir string `proxy:"state-dir,omitempty"`
-	// UDP 是否支持 UDP。IPv6/UDP 数据面尚未在真机上证伪，默认关闭。
+	// UDP 是否支持 UDP，配置解析时默认开启；IPv6 强制关闭。
 	UDP bool `proxy:"udp,omitempty"`
 	// RenewInterval 为会话维护间隔（秒），0 使用默认 60，-1 禁用。
 	RenewInterval int `proxy:"renew-interval,omitempty"`
@@ -98,8 +98,11 @@ func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
 	if option.Server == "" {
 		return nil, fmt.Errorf("enagent[%s]: 缺少 server", option.Name)
 	}
-	if option.Port <= 0 {
+	if option.Port == 0 {
 		option.Port = defaultEnAgentPort
+	}
+	if option.Port < 1 || option.Port > 65535 {
+		return nil, errors.New("enagent: port 必须在 1–65535 之间")
 	}
 
 	username := option.Username
@@ -116,6 +119,7 @@ func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
 	}
 	option.Username = username
 	option.Server = strings.ToLower(strings.TrimSuffix(option.Server, "."))
+	option.IPVersion = C.IPv4Only
 	maxSeconds := int64((1<<63 - 1) / int64(time.Second))
 	if option.RenewInterval < -1 || option.HeartbeatTimeout < 0 || int64(option.RenewInterval) > maxSeconds || int64(option.HeartbeatTimeout) > maxSeconds {
 		return nil, errors.New("enagent: 会话维护或心跳超时配置非法")
@@ -154,11 +158,11 @@ func NewEnAgent(option EnAgentOption) (*EnAgent, error) {
 func (e *EnAgent) IsL3Protocol(*C.Metadata) bool { return true }
 
 func (e *EnAgent) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	st, err := e.ensureStack(ctx)
-	if err != nil {
+	if err := e.ensureResolved(ctx, metadata); err != nil {
 		return nil, err
 	}
-	if err := e.ensureResolved(ctx, metadata); err != nil {
+	st, err := e.ensureStack(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -173,6 +177,9 @@ func (e *EnAgent) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn
 }
 
 func (e *EnAgent) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if !e.option.UDP {
+		return nil, errors.New("enagent: UDP 已禁用")
+	}
 	if err := e.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
@@ -181,12 +188,8 @@ func (e *EnAgent) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		return nil, err
 	}
 
-	network := "udp4"
-	if metadata.DstIP.Is6() {
-		network = "udp6"
-	}
 	// 绑定本机虚拟地址上的随机端口；目的地由 WriteTo 决定。
-	pc, err := st.ListenPacket(ctx, network, net.JoinHostPort("0.0.0.0", "0"))
+	pc, err := st.ListenPacket(ctx, "udp4", "0.0.0.0:0")
 	if err != nil {
 		e.shared.invalidate(err)
 		return nil, err
@@ -196,11 +199,25 @@ func (e *EnAgent) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 
 func (e *EnAgent) SupportUDP() bool { return e.option.UDP }
 
+func (e *EnAgent) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if metadata.DstIP.IsValid() && !metadata.DstIP.Unmap().Is4() {
+		return errors.New("enagent: IPv6 已禁用")
+	}
+	if err := e.Base.ResolveUDP(ctx, metadata); err != nil {
+		return err
+	}
+	metadata.DstIP = metadata.DstIP.Unmap()
+	if !metadata.DstIP.Is4() {
+		return errors.New("enagent: 目标必须是 IPv4 地址")
+	}
+	return nil
+}
+
 // ensureResolved 在 metadata 还没有目标 IP 时补一次解析（正常情况下 mihomo 已经
 // 解析过了，因为 IsL3Protocol 会阻止域名被透传）。
 func (e *EnAgent) ensureResolved(ctx context.Context, metadata *C.Metadata) error {
 	if metadata.DstIP.IsValid() {
-		return nil
+		return e.ResolveUDP(ctx, metadata)
 	}
 	if metadata.Host == "" {
 		return errors.New("enagent: 目标既没有 IP 也没有域名")
@@ -252,7 +269,6 @@ func (e *enAgentState) buildStack(ctx context.Context) (*stack.Stack, *session.S
 	st, err := stack.New(stack.Options{
 		VirtualIPv4: auth.VirtualIPv4,
 		PrefixLen:   prefixLen,
-		VirtualIPv6: auth.VirtualIPv6,
 		Sender:      stack.SenderFunc(sess.WriteIP),
 		Logf: func(format string, args ...any) {
 			log.Debugln("enagent[%s] "+format, append([]any{e.option.Name}, args...)...)
@@ -305,7 +321,9 @@ func (e *enAgentState) connectTunnel(ctx context.Context, handler *enAgentPacket
 					port = spa.DefaultPort
 				}
 				knockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				err := spa.Knock(knockCtx, endpoint.Host, port, spa.Options{User: e.option.Username})
+				err := spa.Knock(knockCtx, endpoint.Host, port, spa.Options{
+					User: e.option.Username, Access: "tcp/" + strconv.Itoa(endpoint.Port),
+				})
 				cancel()
 				if err != nil {
 					log.Warnln("enagent[%s]: SPA 敲门失败: %v", e.option.Name, err)
