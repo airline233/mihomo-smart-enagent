@@ -20,7 +20,7 @@ on:
         required: false
         default: ''
   schedule:
-    # 每天 03:17 UTC 跟随上游重建一次。
+    # 每天 03:17 UTC 检查上游是否有新 commit。
     - cron: '17 3 * * *'
 
 permissions:
@@ -30,7 +30,61 @@ env:
   UPSTREAM: https://github.com/lux5am/mihomo-smart.git
 
 jobs:
+  preflight:
+    name: 检查上游更新
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.check.outputs.should-build }}
+      upstream-ref: ${{ steps.resolve.outputs.ref }}
+      upstream-sha: ${{ steps.resolve.outputs.sha }}
+      upstream-short-sha: ${{ steps.resolve.outputs.short-sha }}
+      release-tag: ${{ steps.check.outputs.release-tag }}
+    steps:
+      - name: 解析上游 ref 与 commit
+        id: resolve
+        run: |
+          set -euo pipefail
+          ref='${{ github.event.inputs.upstream-ref }}'
+          if [ '${{ github.event.inputs.ref-canary }}' = 'head' ]; then ref='Alpha'; fi
+          if [ -z "$ref" ]; then ref='Alpha'; fi
+
+          sha=$(git ls-remote "$UPSTREAM" "refs/heads/$ref" "refs/tags/$ref" | head -n1 | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "::error::上游不存在 ref: $ref"
+            exit 1
+          fi
+          short_sha=${sha:0:12}
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short-sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "上游 $ref: $sha"
+
+      - name: 检查本仓库是否已经构建
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          releases=$(curl -fsS \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          if jq -e --arg sha '${{ steps.resolve.outputs.sha }}' \
+              'any(.[]; ((.body // "") | contains($sha)))' <<< "$releases" >/dev/null; then
+            echo "上游 commit ${{ steps.resolve.outputs.sha }} 已经在本仓库构建过，跳过构建"
+            should_build=false
+          else
+            echo "上游 commit ${{ steps.resolve.outputs.sha }} 尚未在本仓库构建，将构建"
+            should_build=true
+          fi
+          release_date=$(date -u +%F)
+          release_tag="${release_date}-${{ steps.resolve.outputs.short-sha }}"
+          echo "should-build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "release-tag=$release_tag" >> "$GITHUB_OUTPUT"
+
   build:
+    if: needs.preflight.outputs.should-build == 'true'
+    needs: preflight
     name: ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
@@ -41,6 +95,7 @@ jobs:
           - { target: windows-amd64, goos: windows, goarch: amd64, goamd64: v3, ext: '.exe' }
           - { target: linux-amd64,   goos: linux,   goarch: amd64, goamd64: v3, ext: '' }
           - { target: linux-arm64,   goos: linux,   goarch: arm64, goamd64: '',  ext: '' }
+          - { target: macos-arm64,   goos: darwin,  goarch: arm64, goamd64: '',  ext: '' }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,25 +107,16 @@ jobs:
           # 每次都 clone 上游，module cache 复用价值有限，关掉更省事。
           cache: false
 
-      - name: 解析上游 ref
-        id: upstream
-        working-directory: src
-        run: |
-          set -euo pipefail
-          ref='${{ github.event.inputs.upstream-ref }}'
-          if [ '${{ github.event.inputs.ref-canary }}' = 'head' ]; then
-            # 手动触发才允许跟 HEAD
-            ref='Alpha'
-          fi
-          if [ -z "$ref" ]; then ref='Alpha'; fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "使用上游 ref: $ref"
-
       - name: clone 上游
         working-directory: src
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch '${{ steps.upstream.outputs.ref }}' "$UPSTREAM" mihomo
+          git clone --depth 1 --branch '${{ needs.preflight.outputs.upstream-ref }}' "$UPSTREAM" mihomo
+          actual_sha=$(git -C mihomo rev-parse HEAD)
+          if [ "$actual_sha" != '${{ needs.preflight.outputs.upstream-sha }}' ]; then
+            echo "::error::clone 到的上游 commit 与预检不一致"
+            exit 1
+          fi
           echo "UPSTREAM_SHA=$(git -C mihomo rev-parse --short HEAD)" >> "$GITHUB_ENV"
           git -C mihomo log -1 --format='上游 HEAD: %H %ad %s' --date=short
 
@@ -103,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ../dist
-          version="enagent-${{ steps.upstream.outputs.ref }}-${UPSTREAM_SHA}"
+          version="enagent-${{ needs.preflight.outputs.upstream-ref }}-${{ needs.preflight.outputs.upstream-short-sha }}"
           go build -tags with_gvisor -trimpath \
             -ldflags "-s -w -X github.com/metacubex/mihomo/constant.Version=$version -X github.com/metacubex/mihomo/constant.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -o "../dist/mihomo-enagent-${{ matrix.target }}${{ matrix.ext }}" .
@@ -126,19 +172,32 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    if: needs.preflight.outputs.should-build == 'true'
+    needs: [preflight, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: 上传 release 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-enagent-release-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.preflight.outputs.release-tag }}
+          name: mihomo-enagent ${{ needs.preflight.outputs.release-tag }}
           files: dist/*
           body: |
             基于 [lux5am/mihomo-smart](https://github.com/lux5am/mihomo-smart) + enagent outbound 构建。
+
+            上游 ref：`${{ needs.preflight.outputs.upstream-ref }}`
+            上游 commit：`${{ needs.preflight.outputs.upstream-sha }}`
 
             ⚠️ 仅通过"能编译 + 已链接 EnAgent 实现"的检查。真机联通性需要校园网与
             真实 passkey 凭据，只能在本地验证，请自行测试后再使用。
