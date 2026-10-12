@@ -18,10 +18,10 @@
 proxies:
   - name: nuist
     type: enagent
-    server: client.vpn.nuist.edu.cn
+    server: client.vpn.xxxxx
     port: 443
     passkey:
-      rpId: authserver.nuist.edu.cn
+      rpId: authserver.xxxxx
       credentialId: "填写凭据中的 credentialId"
       userId: "填写凭据中的 userId"
       anonbiometricsd: "填写凭据中的 anonbiometricsd"
