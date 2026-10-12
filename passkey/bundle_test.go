@@ -28,7 +28,7 @@ const (
 
 // webauthnOrigin 是 clientDataJSON 里必须使用的真实 authserver origin：
 // 即使经 webvpn 代理，填代理域名也会被服务端以 401 拒绝。
-const webauthnOrigin = "https://authserver.nuist.edu.cn"
+const webauthnOrigin = "https://authserver.xxxxx"
 
 func genKey(t *testing.T, curve elliptic.Curve) *ecdsa.PrivateKey {
 	t.Helper()
@@ -103,7 +103,7 @@ func webAuthnMessage(rpID string) (message, clientDataJSON []byte) {
 func inlinePEMBundle(t *testing.T, key *ecdsa.PrivateKey) map[string]any {
 	t.Helper()
 	return roundTripJSON(t, map[string]any{
-		FieldRPID:       "authserver.nuist.edu.cn",
+		FieldRPID:       "authserver.xxxxx",
 		FieldCredential: syntheticCredID,
 		FieldKeyPEM:     pemText(t, key),
 		FieldUserID:     UserIDFor(syntheticUsername),
@@ -118,7 +118,7 @@ func TestParseInlineBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse 失败: %v", err)
 	}
-	if b.RPID != "authserver.nuist.edu.cn" {
+	if b.RPID != "authserver.xxxxx" {
 		t.Errorf("RPID = %q", b.RPID)
 	}
 	if b.CredentialID != syntheticCredID {
@@ -162,7 +162,7 @@ func TestParseJWKBundle(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			fields := roundTripJSON(t, map[string]any{
-				FieldRPID:       "authserver.nuist.edu.cn",
+				FieldRPID:       "authserver.xxxxx",
 				FieldCredential: syntheticCredID,
 				FieldKeyJWK:     jwkOf(key, withXY),
 				FieldUserID:     UserIDFor(syntheticUsername),
@@ -187,7 +187,7 @@ func TestParseJWKBundle(t *testing.T) {
 func TestParseFromLiteralPasskeyJSON(t *testing.T) {
 	key := genKey(t, elliptic.P256())
 	raw := fmt.Sprintf(`{
-  "rpId": "authserver.nuist.edu.cn",
+  "rpId": "authserver.xxxxx",
   "credentialId": %q,
   "privateKeyPkcs8Pem": %q,
   "userId": %q,
@@ -211,7 +211,7 @@ func TestParseFromLiteralPasskeyJSON(t *testing.T) {
 }
 
 func TestParseMissingFields(t *testing.T) {
-	_, err := Parse(map[string]any{FieldRPID: "authserver.nuist.edu.cn"})
+	_, err := Parse(map[string]any{FieldRPID: "authserver.xxxxx"})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("err = %v，期望 ErrInvalid", err)
 	}
@@ -224,7 +224,7 @@ func TestParseMissingFields(t *testing.T) {
 
 func TestParseMissingKey(t *testing.T) {
 	_, err := Parse(map[string]any{
-		FieldRPID:       "authserver.nuist.edu.cn",
+		FieldRPID:       "authserver.xxxxx",
 		FieldCredential: syntheticCredID,
 		FieldUserID:     UserIDFor(syntheticUsername),
 		FieldStartID:    "anon-start-id",
@@ -273,7 +273,7 @@ func TestParseRejectsTamperedJWK(t *testing.T) {
 	jwk := jwkOf(key, true)
 	jwk["x"] = b64(genKey(t, elliptic.P256()).X.FillBytes(make([]byte, 32)))
 	fields := roundTripJSON(t, map[string]any{
-		FieldRPID:       "authserver.nuist.edu.cn",
+		FieldRPID:       "authserver.xxxxx",
 		FieldCredential: syntheticCredID,
 		FieldKeyJWK:     jwk,
 		FieldUserID:     UserIDFor(syntheticUsername),
@@ -290,7 +290,7 @@ func TestParseRejectsBadJWKCurve(t *testing.T) {
 	jwk := jwkOf(key, false)
 	jwk["crv"] = "P-384"
 	fields := roundTripJSON(t, map[string]any{
-		FieldRPID:       "authserver.nuist.edu.cn",
+		FieldRPID:       "authserver.xxxxx",
 		FieldCredential: syntheticCredID,
 		FieldKeyJWK:     jwk,
 		FieldUserID:     UserIDFor(syntheticUsername),
@@ -309,7 +309,7 @@ func TestParseToleratesMapAnyAny(t *testing.T) {
 		jwk[k] = v
 	}
 	b, err := Parse(map[string]any{
-		FieldRPID:       "authserver.nuist.edu.cn",
+		FieldRPID:       "authserver.xxxxx",
 		FieldCredential: syntheticCredID,
 		FieldKeyJWK:     jwk,
 		FieldUserID:     UserIDFor(syntheticUsername),

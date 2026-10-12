@@ -429,7 +429,7 @@ func TestConnectValidatesConfig(t *testing.T) {
 
 func TestServerNameFollowsSNIRule(t *testing.T) {
 	// 域名带 SNI、IP 字面量不带 —— 与原客户端 tls.Dial 的行为一致。
-	if got := serverName(Config{Host: "client.vpn.nuist.edu.cn"}); got != "client.vpn.nuist.edu.cn" {
+	if got := serverName(Config{Host: "client.vpn.xxxxx"}); got != "client.vpn.xxxxx" {
 		t.Errorf("域名 ServerName = %q", got)
 	}
 	if got := serverName(Config{Host: "202.195.225.220"}); got != "202.195.225.220" {

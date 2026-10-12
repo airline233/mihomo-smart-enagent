@@ -5,7 +5,7 @@
 // mihomo 配置的 passkey 字段里（不做任何改名）：
 //
 //	passkey:
-//	  rpId: authserver.nuist.edu.cn
+//	  rpId: authserver.xxxxx
 //	  credentialId: "..."
 //	  privateKeyPkcs8Pem: |
 //	    -----BEGIN PRIVATE KEY-----

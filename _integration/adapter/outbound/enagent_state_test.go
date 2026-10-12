@@ -174,7 +174,7 @@ func enAgentFixture(t *testing.T, block bool, modes ...string) (EnAgentOption, *
 	}
 	option := EnAgentOption{BasicOption: BasicOption{DialerForAPI: dialer}, Name: "fixture", Server: host, Port: p,
 		SkipCertVerify: true, StateDir: t.TempDir(), RenewInterval: 1, HeartbeatTimeout: 2,
-		Passkey: map[string]any{"rpId": "authserver.nuist.edu.cn", "credentialId": "test-credential",
+		Passkey: map[string]any{"rpId": "authserver.xxxxx", "credentialId": "test-credential",
 			"userId": base64.RawURLEncoding.EncodeToString([]byte("202500000000")), "anonbiometricsd": "test-start",
 			"privateKeyPkcs8Pem": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))}}
 	return option, &connections, &rules, &renew

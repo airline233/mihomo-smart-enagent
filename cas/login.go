@@ -3,7 +3,7 @@
 //
 // 与 authserver_login/NuistLogin.py 的 use_vpn=True 路径等价，但**只保留隧道需要
 // 的那一段**：在真实 authserver 上做一次 CAS 断言，service 指向控制器的 CAS 回调，
-// 从而拿到 client.vpn.nuist.edu.cn 域的会话 Cookie。webvpn 代理那条分支隧道用不到，
+// 从而拿到 client.vpn.xxxxx 域的会话 Cookie。webvpn 代理那条分支隧道用不到，
 // 没有实现。
 //
 // 登录是纯网络层 + 本地私钥签名，不需要浏览器、不需要验证码、不需要口令加密。
@@ -34,13 +34,13 @@ import (
 
 const (
 	// AuthServerNormal 是统一身份认证地址。
-	AuthServerNormal = "https://authserver.nuist.edu.cn"
+	AuthServerNormal = "https://authserver.xxxxx"
 	// ControllerNormal 是 Enlink 控制器地址。
-	ControllerNormal = "https://client.vpn.nuist.edu.cn"
+	ControllerNormal = "https://client.vpn.xxxxx"
 	// VPNCASCallback 是默认控制器的 CAS 回调；自定义控制器时使用对应地址。
 	VPNCASCallback = ControllerNormal + "/enlink/api/client/callback/cas"
 	// VPNDomain 是会话 Cookie 所属的域。
-	VPNDomain = "client.vpn.nuist.edu.cn"
+	VPNDomain = "client.vpn.xxxxx"
 	// WebAuthnOrigin 是 clientDataJSON 里必须填的 origin。
 	//
 	// 它必须固定为**真实 authserver**：即使经 webvpn 代理访问，填代理域名也会被

@@ -32,7 +32,7 @@ const (
 	testUID       = "0123456789abcdef0123456789abcdef"
 	testToken     = "00000000-0000-0000-0000-000000000001"
 	testCredID    = "test-credential-id"
-	testRPID      = "authserver.nuist.edu.cn"
+	testRPID      = "authserver.xxxxx"
 	testChallenge = "dGVzdC1jaGFsbGVuZ2U"
 )
 
@@ -173,7 +173,7 @@ func newFakeEnv(t *testing.T, bundle *passkey.Bundle, pub *ecdsa.PublicKey, conf
 		}
 		if calls > withoutToken {
 			data["token"] = testToken
-			data["server"] = "client.vpn.nuist.edu.cn:443||202.195.225.220:443||443"
+			data["server"] = "client.vpn.xxxxx:443||202.195.225.220:443||443"
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"code": "200", "data": data})
@@ -391,7 +391,7 @@ func TestLoginAndFetchRules(t *testing.T) {
 	if len(rules.Servers) != 3 {
 		t.Fatalf("网关候选数 = %d，期望 3（%v）", len(rules.Servers), rules.Servers)
 	}
-	if got := rules.Servers[0].String(); got != "client.vpn.nuist.edu.cn:443" {
+	if got := rules.Servers[0].String(); got != "client.vpn.xxxxx:443" {
 		t.Errorf("Servers[0] = %s", got)
 	}
 	if got := rules.Servers[1].String(); got != "202.195.225.220:443" {
@@ -555,11 +555,11 @@ func TestDecodeClientInfo(t *testing.T) {
 }
 
 func TestParseServers(t *testing.T) {
-	got := parseServers("client.vpn.nuist.edu.cn:443||202.195.225.220:443||443")
+	got := parseServers("client.vpn.xxxxx:443||202.195.225.220:443||443")
 	if len(got) != 3 {
 		t.Fatalf("解析出 %d 项: %v", len(got), got)
 	}
-	if got[0] != (Endpoint{Host: "client.vpn.nuist.edu.cn", Port: 443}) {
+	if got[0] != (Endpoint{Host: "client.vpn.xxxxx", Port: 443}) {
 		t.Errorf("got[0] = %+v", got[0])
 	}
 	if got[2] != (Endpoint{Host: "202.195.225.220", Port: 443}) {
@@ -703,10 +703,10 @@ func TestResolveURL(t *testing.T) {
 }
 
 func TestHostOfAndOriginOf(t *testing.T) {
-	if got := hostOf("https://client.vpn.nuist.edu.cn/enlink/x"); got != "client.vpn.nuist.edu.cn" {
+	if got := hostOf("https://client.vpn.xxxxx/enlink/x"); got != "client.vpn.xxxxx" {
 		t.Errorf("hostOf = %q", got)
 	}
-	if got := originOf("https://authserver.nuist.edu.cn/authserver/login"); got != "https://authserver.nuist.edu.cn" {
+	if got := originOf("https://authserver.xxxxx/authserver/login"); got != "https://authserver.xxxxx" {
 		t.Errorf("originOf = %q", got)
 	}
 }

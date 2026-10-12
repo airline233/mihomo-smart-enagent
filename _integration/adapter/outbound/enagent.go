@@ -51,7 +51,7 @@ const (
 type EnAgentOption struct {
 	BasicOption
 	Name string `proxy:"name"`
-	// Server 是控制器地址，例如 client.vpn.nuist.edu.cn。
+	// Server 是控制器地址，例如 client.vpn.xxxxx。
 	Server string `proxy:"server"`
 	// Port 是控制器端口，默认 443。
 	Port int `proxy:"port,omitempty"`
